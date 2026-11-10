@@ -1424,16 +1424,17 @@ cards:
           if (u.status === 'pending') badgeClass = 'badge-pending';
           if (u.status === 'blocked') badgeClass = 'badge-pending';
 
-          return `<tr>
-            <td><b>${escapeHtml(u.name || 'Desconhecido')}</b> ${u.username ? '@' + escapeHtml(u.username) : ''}</td>
-            <td><code>${u.chat_id}</code></td>
-            <td><span class="badge ${badgeClass}">${u.status.toUpperCase()}</span></td>
-            <td>
-              ${u.status === 'pending' ? `<button class="btn btn-sm btn-success" onclick="userAction('approve', '${u.chat_id}')">Aprovar</button>` : ''}
-              ${u.status !== 'blocked' && u.status !== 'admin' ? `<button class="btn btn-sm btn-danger" onclick="userAction('block', '${u.chat_id}')">Bloquear</button>` : ''}
-              ${u.status === 'blocked' ? `<button class="btn btn-sm btn-success" onclick="userAction('approve', '${u.chat_id}')">Desbloquear</button>` : ''}
-            </td>
-          </tr>`;
+          return '' +
+            '<tr>' +
+            '<td><b>' + escapeHtml(u.name || 'Desconhecido') + '</b> ' + (u.username ? '@' + escapeHtml(u.username) : '') + '</td>' +
+            '<td><code>' + u.chat_id + '</code></td>' +
+            '<td><span class="badge ' + badgeClass + '">' + u.status.toUpperCase() + '</span></td>' +
+            '<td>' +
+              (u.status === 'pending' ? '<button class="btn btn-sm btn-success" onclick="userAction(\'approve\', \'' + u.chat_id + '\')">Aprovar</button> ' : '') +
+              (u.status !== 'blocked' && u.status !== 'admin' ? '<button class="btn btn-sm btn-danger" onclick="userAction(\'block\', \'' + u.chat_id + '\')">Bloquear</button> ' : '') +
+              (u.status === 'blocked' ? '<button class="btn btn-sm btn-success" onclick="userAction(\'approve\', \'' + u.chat_id + '\')">Desbloquear</button> ' : '') +
+            '</td>' +
+          '</tr>';
         }).join('');
       } catch (e) {
         console.error(e);
@@ -1481,7 +1482,7 @@ cards:
           let color = '#38bdf8';
           if (l.type === 'WARN') color = '#f59e0b';
           if (l.type === 'IA') color = '#a855f7';
-          return `<div style="margin-bottom: 4px;"><span style="color: var(--text-muted)">[${l.timestamp}]</span> <b style="color: ${color}">[${l.type}]</b> ${escapeHtml(l.message)}</div>`;
+          return '<div style="margin-bottom: 4px;"><span style="color: var(--text-muted)">[' + l.timestamp + ']</span> <b style="color: ' + color + '">[' + l.type + ']</b> ' + escapeHtml(l.message) + '</div>';
         }).join('');
       } catch (e) {
         console.error(e);
