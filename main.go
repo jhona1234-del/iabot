@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	AppVersion       = "1.0.0"
+	AppVersion       = "1.1.0"
 	AppDeveloper     = "Jhonatan Garcia (jhona1234)"
 	DefaultPort      = "8099"
 	SettingsFilePath = "/data/iabot_settings.json"
@@ -48,6 +48,8 @@ type IABoTSettings struct {
 	EnableAI         bool                     `json:"enable_ai"`
 	GeminiAPIKey     string                   `json:"gemini_api_key"`
 	GeminiModel      string                   `json:"gemini_model"`
+	ModelsPriority   string                   `json:"models_priority"`
+	LastModelUsed    string                   `json:"last_model_used"`
 	SystemPrompt     string                   `json:"system_prompt"`
 	TelegramUsers    map[string]*TelegramUser `json:"telegram_users"`
 	MessagesSent     int64                    `json:"messages_sent"`
@@ -88,11 +90,12 @@ func loadSettings() {
 	defer settingsMu.Unlock()
 
 	settings = IABoTSettings{
-		BotName:       "Herbie",
-		EnableAI:      true,
-		GeminiModel:   "gemini-2.5-flash",
-		SystemPrompt:  "Você é o Herbie, o assistente inteligente da casa de Jhonatan e Claudia. Você é amigável, direto, prestativo e fala português do Brasil com naturalidade e emojis moderados.",
-		TelegramUsers: make(map[string]*TelegramUser),
+		BotName:        "Herbie",
+		EnableAI:       true,
+		GeminiModel:    "gemini-3.6-flash",
+		ModelsPriority: "gemini-3.6-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite",
+		SystemPrompt:   "Você é o Herbie, o assistente inteligente da casa de Jhonatan e Claudia. Você é amigável, direto, prestativo e fala português do Brasil com naturalidade e emojis moderados.",
+		TelegramUsers:  make(map[string]*TelegramUser),
 	}
 
 	data, err := os.ReadFile(SettingsFilePath)
@@ -110,8 +113,11 @@ func loadSettings() {
 	if settings.BotName == "" {
 		settings.BotName = "Herbie"
 	}
-	if settings.GeminiModel == "" {
-		settings.GeminiModel = "gemini-2.5-flash"
+		if strings.Contains(settings.GeminiModel, "1.5") || strings.Contains(settings.GeminiModel, "2.5") || settings.GeminiModel == "" {
+		settings.GeminiModel = "gemini-3.6-flash"
+	}
+	if strings.Contains(settings.ModelsPriority, "1.5") || strings.Contains(settings.ModelsPriority, "2.5") || settings.ModelsPriority == "" {
+		settings.ModelsPriority = "gemini-3.6-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite"
 	}
 }
 
@@ -282,10 +288,42 @@ type GeminiResponse struct {
 	} `json:"error"`
 }
 
+var defaultModelsPriority = []string{
+	"gemini-3.6-flash",
+	"gemini-3.5-flash-lite",
+	"gemini-3.1-flash-lite",
+}
+
+func getModelsToTry(selectedModel, priorityStr string) []string {
+	var models []string
+	if priorityStr != "" {
+		for _, m := range strings.Split(priorityStr, ",") {
+			m = strings.TrimSpace(m)
+			if m != "" && !strings.Contains(m, "1.5") && !strings.Contains(m, "2.5") {
+				models = append(models, m)
+			}
+		}
+	}
+	if len(models) == 0 {
+		models = defaultModelsPriority
+	}
+	if selectedModel != "" {
+		filtered := []string{selectedModel}
+		for _, m := range models {
+			if m != selectedModel {
+				filtered = append(filtered, m)
+			}
+		}
+		return filtered
+	}
+	return models
+}
+
 func callGeminiAI(userChatID, userPrompt string) (string, error) {
 	settingsMu.RLock()
 	apiKey := settings.GeminiAPIKey
-	model := settings.GeminiModel
+	selectedModel := settings.GeminiModel
+	priorityStr := settings.ModelsPriority
 	sysPrompt := settings.SystemPrompt
 	settingsMu.RUnlock()
 
@@ -305,6 +343,8 @@ func callGeminiAI(userChatID, userPrompt string) (string, error) {
 	chatHistory[userChatID] = history
 	chatHistoryMu.Unlock()
 
+	modelsToTry := getModelsToTry(selectedModel, priorityStr)
+
 	reqBody := GeminiRequest{
 		Contents: history,
 	}
@@ -314,42 +354,56 @@ func callGeminiAI(userChatID, userPrompt string) (string, error) {
 			Parts: []GeminiPart{{Text: sysPrompt}},
 		}
 	}
-
 	payload, _ := json.Marshal(reqBody)
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
-	resp, err := httpClient.Post(url, "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		return "", err
+
+	var lastErr error
+	for _, modelName := range modelsToTry {
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", modelName, apiKey)
+		resp, err := httpClient.Post(url, "application/json", bytes.NewBuffer(payload))
+		if err != nil {
+			lastErr = err
+			addLog("WARN", fmt.Sprintf("Modelo %s erro de rede: %v. Tentando próximo...", modelName, err))
+			continue
+		}
+
+		var geminiResp GeminiResponse
+		err = json.NewDecoder(resp.Body).Decode(&geminiResp)
+		resp.Body.Close()
+
+		if err != nil {
+			lastErr = err
+			addLog("WARN", fmt.Sprintf("Modelo %s falha de json: %v. Tentando próximo...", modelName, err))
+			continue
+		}
+
+		if geminiResp.Error != nil {
+			lastErr = fmt.Errorf("%s", geminiResp.Error.Message)
+			addLog("WARN", fmt.Sprintf("Modelo %s sem cota ou erro: %s. Tentando próximo...", modelName, geminiResp.Error.Message))
+			continue
+		}
+
+		if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+			replyText := geminiResp.Candidates[0].Content.Parts[0].Text
+
+			chatHistoryMu.Lock()
+			chatHistory[userChatID] = append(chatHistory[userChatID], GeminiContent{
+				Role:  "model",
+				Parts: []GeminiPart{{Text: replyText}},
+			})
+			chatHistoryMu.Unlock()
+
+			settingsMu.Lock()
+			settings.AITokensUsed += geminiResp.UsageMetadata.TotalTokenCount
+			settings.LastModelUsed = modelName
+			settingsMu.Unlock()
+
+			addLog("IA", fmt.Sprintf("Sucesso com modelo [%s] (%d tokens)", modelName, geminiResp.UsageMetadata.TotalTokenCount))
+			return replyText, nil
+		}
 	}
-	defer resp.Body.Close()
 
-	var geminiResp GeminiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-		return "", err
-	}
-
-	if geminiResp.Error != nil {
-		return "", fmt.Errorf("gemini api error: %s", geminiResp.Error.Message)
-	}
-
-	if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
-		replyText := geminiResp.Candidates[0].Content.Parts[0].Text
-
-		chatHistoryMu.Lock()
-		chatHistory[userChatID] = append(chatHistory[userChatID], GeminiContent{
-			Role:  "model",
-			Parts: []GeminiPart{{Text: replyText}},
-		})
-		chatHistoryMu.Unlock()
-
-		settingsMu.Lock()
-		settings.AITokensUsed += geminiResp.UsageMetadata.TotalTokenCount
-		settingsMu.Unlock()
-
-		return replyText, nil
-	}
-
-	return "Desculpe, não consegui gerar uma resposta no momento.", nil
+	addLog("WARN", fmt.Sprintf("Todos os modelos da fila falharam: %v", lastErr))
+	return fmt.Sprintf("⚠️ Todos os modelos da fila (%s) estão sem cota no momento. Aguarde alguns minutos!", strings.Join(modelsToTry, ", ")), nil
 }
 
 // Telegram Polling Engine
@@ -907,6 +961,8 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 			"admin_chat_id":      settings.AdminChatID,
 			"enable_ai":          settings.EnableAI,
 			"gemini_model":       settings.GeminiModel,
+			"models_priority":      settings.ModelsPriority,
+			"last_model_used":     settings.LastModelUsed,
 			"system_prompt":      settings.SystemPrompt,
 			"telegram_bot_token": maskedToken,
 			"gemini_api_key":     maskedGemini,
@@ -928,6 +984,7 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 			EnableAI         bool   `json:"enable_ai"`
 			GeminiAPIKey     string `json:"gemini_api_key"`
 			GeminiModel      string `json:"gemini_model"`
+			ModelsPriority   string `json:"models_priority"`
 			SystemPrompt     string `json:"system_prompt"`
 		}
 
@@ -951,6 +1008,9 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.GeminiModel != "" {
 			settings.GeminiModel = strings.TrimSpace(payload.GeminiModel)
+		}
+		if payload.ModelsPriority != "" {
+			settings.ModelsPriority = strings.TrimSpace(payload.ModelsPriority)
 		}
 		if payload.SystemPrompt != "" {
 			settings.SystemPrompt = strings.TrimSpace(payload.SystemPrompt)
@@ -1178,11 +1238,17 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
             <div class="form-group">
               <label>Modelo Gemini:</label>
               <select id="gemini_model">
-                <option value="gemini-2.5-flash">gemini-2.5-flash (Mais Rápido &amp; Inteligente)</option>
-                <option value="gemini-1.5-flash">gemini-1.5-flash</option>
-                <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+                <option value="gemini-3.6-flash">gemini-3.6-flash (Mais Novo &amp; Principal)</option>
+                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Rápido / Fallback 1)</option>
+                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Econômico / Fallback 2)</option>
               </select>
             </div>
+          </div>
+
+          <div class="form-group">
+            <label>Fila de Prioridade dos Modelos (Fallback Automático):</label>
+            <input type="text" id="models_priority" value="gemini-3.6-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite">
+            <small style="color: var(--text-muted); display: block; margin-top: 4px;">Se o modelo principal atingir limite de cota, o IABoT tenta o próximo da fila automaticamente.</small>
           </div>
 
           <div class="form-group">
@@ -1372,7 +1438,8 @@ cards:
         const d = await res.json();
         document.getElementById('bot_name').value = d.bot_name || 'Herbie';
         document.getElementById('admin_chat_id').value = d.admin_chat_id || '';
-        document.getElementById('gemini_model').value = d.gemini_model || 'gemini-2.5-flash';
+        document.getElementById('gemini_model').value = d.gemini_model || 'gemini-3.6-flash';
+        document.getElementById('models_priority').value = d.models_priority || 'gemini-3.6-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite';
         document.getElementById('enable_ai').checked = d.enable_ai !== false;
         document.getElementById('system_prompt').value = d.system_prompt || '';
         if (d.telegram_bot_token) document.getElementById('telegram_bot_token').placeholder = d.telegram_bot_token;
@@ -1388,6 +1455,7 @@ cards:
         bot_name: document.getElementById('bot_name').value,
         admin_chat_id: document.getElementById('admin_chat_id').value,
         gemini_model: document.getElementById('gemini_model').value,
+        models_priority: document.getElementById('models_priority').value,
         enable_ai: document.getElementById('enable_ai').checked,
         system_prompt: document.getElementById('system_prompt').value,
         telegram_bot_token: document.getElementById('telegram_bot_token').value,
